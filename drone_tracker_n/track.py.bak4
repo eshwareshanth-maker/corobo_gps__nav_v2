@@ -1,0 +1,297 @@
+import os
+import time
+import shutil
+import threading
+import cv2
+from ultralytics import YOLO
+
+# ---------------- CONFIG ----------------
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_PT = os.path.join(HERE, "yolov8n-drone.pt")
+MODEL_PT_ROI = os.path.join(HERE, "yolov8n-drone-roi.pt")   # auto-copy of the same weights, exported at ROI size
+
+CAMERA_SOURCE = 0
+CAP_WIDTH = 640
+CAP_HEIGHT = 480
+
+CONF_THRESHOLD = 0.25     # confidence while tracking inside the ROI
+LOCK_CONF = 0.40          # confidence needed on a full-frame search to lock on
+IMG_SIZE = 480            # full-frame search size
+ROI_SIZE = 256            # ROI square in camera pixels (multiple of 32); also the ROI model input size
+LOST_LIMIT = 3            # ROI misses in a row before going back to full-frame search
+INFER_INTERVAL = 0.05     # seconds to rest between detections (keeps CPU free for the webcam and sim)
+
+MOVE_SPEED = 50           # pixels per second to count as movement
+STOP_FRAMES = 4           # consecutive still detections before printing STOP
+SMOOTH = 0.5              # 1.0 = no smoothing, lower = smoother dot
+PRINT_INTERVAL = 0.3      # seconds between repeated prints of the same direction
+DOT_TTL = 1.0             # seconds to keep drawing the dot after the last detection
+SHOW_ROI = True           # draw the thin yellow ROI square while tracking
+# -----------------------------------------
+
+state = {
+    "frame": None, "frame_id": 0,
+    "det": None, "det_time": 0.0,          # det = (cx, cy, conf), last valid
+    "status": "SEARCH", "roi": None, "det_seq": 0,
+    "infer_ms": 0.0, "running": True,
+}
+lock = threading.Lock()
+
+
+def load_model(pt_path, imgsz):
+    ov_dir = pt_path.replace(".pt", "_openvino_model")
+    try:
+        if not os.path.isdir(ov_dir):
+            print(f"First run: exporting {os.path.basename(pt_path)} at {imgsz}px (about a minute)...")
+            YOLO(pt_path).export(format="openvino", imgsz=imgsz)
+        return YOLO(ov_dir, task="detect")
+    except Exception as e:
+        print(f"OpenVINO failed ({e}); falling back to PyTorch.")
+        return YOLO(pt_path)
+
+
+def load_models():
+    if not os.path.isfile(MODEL_PT):
+        raise FileNotFoundError(f"Model not found: {MODEL_PT}")
+    if not os.path.isfile(MODEL_PT_ROI):
+        shutil.copyfile(MODEL_PT, MODEL_PT_ROI)
+    return load_model(MODEL_PT, IMG_SIZE), load_model(MODEL_PT_ROI, ROI_SIZE)
+
+
+def open_camera():
+    cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera/video source: {CAMERA_SOURCE}")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def clamp_roi(cx, cy, size, w, h):
+    """Square ROI of `size` centered on (cx, cy), kept inside the frame."""
+    size = min(size, w, h)
+    half = size // 2
+    x1 = int(min(max(cx - half, 0), w - size))
+    y1 = int(min(max(cy - half, 0), h - size))
+    return x1, y1, x1 + size, y1 + size
+
+
+def detect_best(model, image, conf, imgsz):
+    """Return (x1, y1, x2, y2, conf) of the most confident detection, or None."""
+    results = model.predict(image, conf=conf, imgsz=imgsz, verbose=False)
+    boxes = results[0].boxes
+    if boxes is None or len(boxes) == 0:
+        return None
+    i = boxes.conf.argmax().item()
+    x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+    return x1, y1, x2, y2, boxes.conf[i].item()
+
+
+def classify_motion(vx, vy, threshold):
+    """LEFT / RIGHT / UP / DOWN / STOP from velocity in px/s (y grows downward)."""
+    if abs(vx) < threshold and abs(vy) < threshold:
+        return "STOP"
+    if abs(vx) >= abs(vy):
+        return "RIGHT" if vx > 0 else "LEFT"
+    return "DOWN" if vy > 0 else "UP"
+
+
+def capture_loop(cap):
+    fails = 0
+    while state["running"]:
+        ret, frame = cap.read()
+        if ret:
+            fails = 0
+            with lock:
+                state["frame"] = frame
+                state["frame_id"] += 1
+            continue
+
+        fails += 1
+        print(f"Frame grab failed ({fails}/10); reconnecting camera...")
+        cap.release()
+        time.sleep(1.0)
+        try:
+            cap = open_camera()
+        except RuntimeError as e:
+            print(e)
+        if fails >= 10:
+            print("Camera did not recover. Re-attach the webcam in VirtualBox and restart.")
+            state["running"] = False
+            break
+
+
+def infer_loop(model_full, model_roi):
+    last_id = -1
+    lock_center = None
+    misses = 0
+
+    while state["running"]:
+        with lock:
+            frame = state["frame"]
+            fid = state["frame_id"]
+        if frame is None or fid == last_id:
+            time.sleep(0.005)
+            continue
+        last_id = fid
+        h, w = frame.shape[:2]
+
+        t0 = time.time()
+        status = "SEARCH"
+        det = None
+        roi = None
+
+        if lock_center is not None:
+            # Tracking: run the small model on a crop around the last position
+            roi = clamp_roi(lock_center[0], lock_center[1], ROI_SIZE, w, h)
+            rx1, ry1, rx2, ry2 = roi
+            d = detect_best(model_roi, frame[ry1:ry2, rx1:rx2].copy(), CONF_THRESHOLD, ROI_SIZE)
+            if d is not None:
+                det = ((d[0] + d[2]) / 2 + rx1, (d[1] + d[3]) / 2 + ry1, d[4])
+                misses = 0
+                status = "TRACK"
+            else:
+                misses += 1
+                if misses >= LOST_LIMIT:
+                    lock_center = None
+                    misses = 0
+                    roi = None
+                    status = "SEARCH"
+                else:
+                    status = "HOLD"
+        else:
+            # Searching: full-frame detection, needs higher confidence to lock on
+            d = detect_best(model_full, frame, LOCK_CONF, IMG_SIZE)
+            if d is not None:
+                det = ((d[0] + d[2]) / 2, (d[1] + d[3]) / 2, d[4])
+                status = "TRACK"
+
+        if det is not None:
+            lock_center = (det[0], det[1])
+
+        infer_ms = (time.time() - t0) * 1000
+        with lock:
+            if det is not None:
+                state["det"] = det
+                state["det_time"] = time.time()
+            state["status"] = status
+            state["roi"] = roi
+            state["det_seq"] += 1
+            state["infer_ms"] = infer_ms
+
+        time.sleep(INFER_INTERVAL)
+
+
+def main():
+    model_full, model_roi = load_models()
+    cap = open_camera()
+
+    threading.Thread(target=capture_loop, args=(cap,), daemon=True).start()
+    threading.Thread(target=infer_loop, args=(model_full, model_roi), daemon=True).start()
+
+    smooth = None
+    prev_pos = None
+    prev_time = 0.0
+    stop_counter = 0
+    last_seq = -1
+    last_shown_id = -1
+    was_lost = False
+    last_label = None
+    last_print = 0.0
+
+    print("Running. Press 'q' in the video window to quit.\n")
+
+    while state["running"]:
+        with lock:
+            frame = state["frame"]
+            fid = state["frame_id"]
+            det = state["det"]
+            det_time = state["det_time"]
+            status = state["status"]
+            roi = state["roi"]
+            seq = state["det_seq"]
+            infer_ms = state["infer_ms"]
+
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        now = time.time()
+
+        # Motion logic runs only when a NEW inference result arrives
+        if seq != last_seq:
+            last_seq = seq
+            if status == "TRACK":
+                cx, cy, conf = det
+                was_lost = False
+                if smooth is None:
+                    smooth = (cx, cy)
+                else:
+                    smooth = (SMOOTH * cx + (1 - SMOOTH) * smooth[0],
+                              SMOOTH * cy + (1 - SMOOTH) * smooth[1])
+                if prev_pos is not None:
+                    dt = max(det_time - prev_time, 1e-3)
+                    vx = (smooth[0] - prev_pos[0]) / dt
+                    vy = (smooth[1] - prev_pos[1]) / dt
+                    motion = classify_motion(vx, vy, MOVE_SPEED)
+                    label = None
+                    if motion == "STOP":
+                        stop_counter += 1
+                        if stop_counter >= STOP_FRAMES:
+                            label = "STOP"
+                    else:
+                        stop_counter = 0
+                        label = motion
+                    if label is not None and (label != last_label or now - last_print >= PRINT_INTERVAL):
+                        print(f"Drone motion: {label}")
+                        last_label = label
+                        last_print = now
+                prev_pos = smooth
+                prev_time = det_time
+            elif status == "SEARCH":
+                if not was_lost:
+                    print("Drone motion: LOST")
+                    was_lost = True
+                    last_label = "LOST"
+                smooth = None
+                prev_pos = None
+                stop_counter = 0
+            # HOLD: drone unseen for a moment but still locked; do nothing
+
+        # Redraw only when a new camera frame has arrived
+        if fid == last_shown_id:
+            if cv2.waitKey(5) & 0xFF == ord("q"):
+                break
+            continue
+        last_shown_id = fid
+
+        frame = frame.copy()
+
+        if SHOW_ROI and roi is not None and status != "SEARCH":
+            cv2.rectangle(frame, (roi[0], roi[1]), (roi[2], roi[3]), (0, 255, 255), 1)
+
+        if det is not None and status in ("TRACK", "HOLD") and (now - det_time) < DOT_TTL:
+            dx, dy, dconf = det
+            color = (0, 0, 255) if status == "TRACK" else (0, 255, 255)
+            cv2.circle(frame, (int(dx), int(dy)), 5, color, -1)
+            cv2.circle(frame, (int(dx), int(dy)), 12, (0, 255, 0), 1)
+            cv2.putText(frame, f"{dconf:.2f}", (int(dx) + 15, int(dy) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        cv2.putText(frame, f"{status}  infer: {infer_ms:.0f} ms", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        cv2.imshow("Drone Detection & Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+    state["running"] = False
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

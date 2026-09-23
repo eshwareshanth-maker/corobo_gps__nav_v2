@@ -1,0 +1,8 @@
+build/
+install/
+log/
+*.pyc
+__pycache__/
+*.pt
+drone_tracker_n/n_env/
+*_openvino_model/

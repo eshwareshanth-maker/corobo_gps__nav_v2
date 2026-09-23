@@ -1,0 +1,125 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="corobo">
+
+  <!-- PARAMETERS -->
+  <xacro:property name="base_len"   value="0.50"/>
+  <xacro:property name="base_wid"   value="0.34"/>
+  <xacro:property name="base_hgt"   value="0.12"/>
+  <xacro:property name="base_mass"  value="12.0"/>
+
+  <xacro:property name="wheel_rad"  value="0.10"/>
+  <xacro:property name="wheel_wid"  value="0.06"/>
+  <xacro:property name="wheel_mass" value="1.2"/>
+
+  <xacro:property name="track"      value="0.40"/>
+  <xacro:property name="wheelbase"  value="0.34"/>
+  <xacro:property name="base_z"     value="${wheel_rad}"/>
+
+  <xacro:include filename="$(find corobo)/urdf/corobo.gazebo.xacro"/>
+  <xacro:include filename="$(find corobo)/urdf/arm.urdf.xacro"/>
+
+  <!-- MACROS -->
+  <xacro:macro name="box_inertia" params="m x y z">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(y*y+z*z)/12.0}" ixy="0" ixz="0"
+               iyy="${m*(x*x+z*z)/12.0}" iyz="0"
+               izz="${m*(x*x+y*y)/12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cyl_inertia" params="m r l">
+    <inertial>
+      <mass value="${m}"/>
+      <inertia ixx="${m*(3*r*r+l*l)/12.0}" ixy="0" ixz="0"
+               iyy="${m*(3*r*r+l*l)/12.0}" iyz="0"
+               izz="${m*r*r/2.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="wheel" params="prefix x y">
+    <link name="${prefix}_wheel">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_rad}" length="${wheel_wid}"/></geometry>
+        <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_rad}" length="${wheel_wid}"/></geometry>
+      </collision>
+      <xacro:cyl_inertia m="${wheel_mass}" r="${wheel_rad}" l="${wheel_wid}"/>
+    </link>
+
+    <joint name="${prefix}_wheel_joint" type="continuous">
+      <parent link="base_link"/>
+      <child  link="${prefix}_wheel"/>
+      <origin xyz="${x} ${y} 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <dynamics damping="0.05" friction="0.05"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- LINKS -->
+  <link name="base_footprint"/>
+
+  <link name="base_link">
+    <visual>
+      <geometry><box size="${base_len} ${base_wid} ${base_hgt}"/></geometry>
+      <material name="orange"><color rgba="0.9 0.45 0.05 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="${base_len} ${base_wid} ${base_hgt}"/></geometry>
+    </collision>
+    <xacro:box_inertia m="${base_mass}" x="${base_len}" y="${base_wid}" z="${base_hgt}"/>
+  </link>
+
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_footprint"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 ${base_z}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:wheel prefix="front_left"  x="${ wheelbase/2}" y="${ track/2}"/>
+  <xacro:wheel prefix="front_right" x="${ wheelbase/2}" y="${-track/2}"/>
+  <xacro:wheel prefix="rear_left"   x="${-wheelbase/2}" y="${ track/2}"/>
+  <xacro:wheel prefix="rear_right"  x="${-wheelbase/2}" y="${-track/2}"/>
+
+  <!-- LIDAR -->
+  <link name="lidar_link">
+    <visual>
+      <geometry><cylinder radius="0.04" length="0.05"/></geometry>
+      <material name="dgrey"><color rgba="0.2 0.2 0.2 1"/></material>
+    </visual>
+    <collision><geometry><cylinder radius="0.04" length="0.05"/></geometry></collision>
+    <xacro:cyl_inertia m="0.15" r="0.04" l="0.05"/>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="lidar_link"/>
+    <origin xyz="0.18 0 ${base_hgt/2 + 0.05}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- IMU -->
+  <link name="imu_link">
+    <visual><geometry><box size="0.03 0.03 0.01"/></geometry></visual>
+    <xacro:box_inertia m="0.02" x="0.03" y="0.03" z="0.01"/>
+  </link>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="imu_link"/>
+    <origin xyz="0 0 ${base_hgt/2}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- GPS -->
+  <link name="gps_link">
+    <visual><geometry><cylinder radius="0.03" length="0.02"/></geometry></visual>
+    <xacro:box_inertia m="0.05" x="0.06" y="0.06" z="0.02"/>
+  </link>
+  <joint name="gps_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="gps_link"/>
+    <origin xyz="-0.18 0 ${base_hgt/2 + 0.08}" rpy="0 0 0"/>
+  </joint>
+
+</robot>

@@ -1,0 +1,65 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+<!-- 2-DOF object-tracking arm. Two motors, velocity-driven via Twist:
+     base_joint  <- /cmd_vel_basejoint   (rotation, yaw)
+     elbow_joint <- /cmd_vel_elbowjoint  (tilt, pitch)
+     No <collision> anywhere below: the lidar ray sensor raycasts against
+     collision geometry only, so this arm can never appear as an obstacle. -->
+
+<link name="arm_base_link">
+  <visual>
+    <geometry><cylinder radius="0.03" length="0.03"/></geometry>
+    <material name="dgrey"><color rgba="0.2 0.2 0.2 1"/></material>
+  </visual>
+  <inertial>
+    <mass value="0.10"/>
+    <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00002"/>
+  </inertial>
+</link>
+
+<joint name="arm_mount_joint" type="fixed">
+  <parent link="base_link"/>
+  <child  link="arm_base_link"/>
+  <origin xyz="-0.10 0 ${base_hgt/2 + 0.015}" rpy="0 0 0"/>
+</joint>
+
+<link name="arm_link1">
+  <visual>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <geometry><cylinder radius="0.015" length="0.10"/></geometry>
+    <material name="orange"><color rgba="0.9 0.45 0.05 1"/></material>
+  </visual>
+  <inertial>
+    <mass value="0.08"/>
+    <inertia ixx="0.00002" ixy="0" ixz="0" iyy="0.00002" iyz="0" izz="0.00001"/>
+  </inertial>
+</link>
+
+<joint name="base_joint" type="continuous">
+  <parent link="arm_base_link"/>
+  <child  link="arm_link1"/>
+  <origin xyz="0 0 0.015" rpy="0 0 0"/>
+  <axis xyz="0 0 1"/>
+  <dynamics damping="0.02" friction="0.01"/>
+</joint>
+
+<link name="arm_link2">
+  <visual>
+    <origin xyz="0.06 0 0" rpy="0 1.5708 0"/>
+    <geometry><cylinder radius="0.012" length="0.12"/></geometry>
+    <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+  </visual>
+  <inertial>
+    <mass value="0.06"/>
+    <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+  </inertial>
+</link>
+
+<joint name="elbow_joint" type="continuous">
+  <parent link="arm_link1"/>
+  <child  link="arm_link2"/>
+  <origin xyz="0 0 0.10" rpy="0 0 0"/>
+  <axis xyz="0 1 0"/>
+  <dynamics damping="0.02" friction="0.01"/>
+</joint>
+</robot>

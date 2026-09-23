@@ -1,0 +1,222 @@
+import os
+import time
+import threading
+import cv2
+from ultralytics import YOLO
+
+# ---------------- CONFIG ----------------
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yolov8n-drone.pt")
+USE_OPENVINO = True
+
+CAMERA_SOURCE = 0         # change to 2 etc. if your webcam is /dev/video2
+CONF_THRESHOLD = 0.25
+IMG_SIZE = 480
+CAP_WIDTH = 640
+CAP_HEIGHT = 480
+
+ENABLE_ROI = False
+ROI_FRAC = (0.15, 0.10, 0.85, 0.90)
+
+MOVE_THRESHOLD = 15       # pixels moved between detections to count as movement
+STOP_FRAMES = 3           # consecutive still detections before printing STOP
+DET_TTL = 1.0             # seconds to keep drawing the box after a detection
+# -----------------------------------------
+
+state = {
+    "frame": None, "frame_id": 0,
+    "det": None, "det_time": 0.0, "det_seq": 0,
+    "infer_ms": 0.0, "running": True,
+}
+lock = threading.Lock()
+
+
+def load_model():
+    if not os.path.isfile(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+    if not USE_OPENVINO:
+        return YOLO(MODEL_PATH)
+    try:
+        ov_dir = MODEL_PATH.replace(".pt", "_openvino_model")
+        if not os.path.isdir(ov_dir):
+            print("First run: exporting to OpenVINO...")
+            YOLO(MODEL_PATH).export(format="openvino", imgsz=IMG_SIZE)
+        return YOLO(ov_dir, task="detect")
+    except Exception as e:
+        print(f"OpenVINO failed ({e}); falling back to PyTorch.")
+        return YOLO(MODEL_PATH)
+
+
+def open_camera():
+    cap = cv2.VideoCapture(CAMERA_SOURCE, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera/video source: {CAMERA_SOURCE}")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAP_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAP_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def get_roi_pixels(frame_shape, roi_frac):
+    h, w = frame_shape[:2]
+    x1f, y1f, x2f, y2f = roi_frac
+    return int(x1f * w), int(y1f * h), int(x2f * w), int(y2f * h)
+
+
+def classify_motion(dx, dy, threshold):
+    """Return LEFT / RIGHT / UP / DOWN / STOP from pixel deltas (y grows downward)."""
+    if abs(dx) < threshold and abs(dy) < threshold:
+        return "STOP"
+    if abs(dx) >= abs(dy):
+        return "RIGHT" if dx > 0 else "LEFT"
+    return "DOWN" if dy > 0 else "UP"
+
+
+def capture_loop(cap):
+    fails = 0
+    while state["running"]:
+        ret, frame = cap.read()
+        if ret:
+            fails = 0
+            with lock:
+                state["frame"] = frame
+                state["frame_id"] += 1
+            continue
+
+        fails += 1
+        print(f"Frame grab failed ({fails}/10); reconnecting camera...")
+        cap.release()
+        time.sleep(1.0)
+        try:
+            cap = open_camera()
+        except RuntimeError as e:
+            print(e)
+        if fails >= 10:
+            print("Camera did not recover. Re-attach the webcam in VirtualBox and restart.")
+            state["running"] = False
+            break
+
+
+def infer_loop(model):
+    last_id = -1
+    while state["running"]:
+        with lock:
+            frame = state["frame"]
+            fid = state["frame_id"]
+        if frame is None or fid == last_id:
+            time.sleep(0.005)
+            continue
+        last_id = fid
+
+        t0 = time.time()
+        results = model.predict(frame, conf=CONF_THRESHOLD,
+                                imgsz=IMG_SIZE, verbose=False)
+        infer_ms = (time.time() - t0) * 1000
+
+        det = None
+        boxes = results[0].boxes
+        if boxes is not None and len(boxes) > 0:
+            i = boxes.conf.argmax().item()
+            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+            det = (x1, y1, x2, y2, boxes.conf[i].item())
+
+        with lock:
+            state["det"] = det
+            state["det_time"] = time.time()
+            state["det_seq"] += 1
+            state["infer_ms"] = infer_ms
+
+
+def main():
+    model = load_model()
+    cap = open_camera()
+
+    threading.Thread(target=capture_loop, args=(cap,), daemon=True).start()
+    threading.Thread(target=infer_loop, args=(model,), daemon=True).start()
+
+    prev_center = None
+    stop_counter = 0
+    last_seq = -1
+    was_lost = False
+    last_shown_id = -1
+
+    print("Running. Press 'q' in the video window to quit.\n")
+
+    while state["running"]:
+        with lock:
+            frame = state["frame"]
+            fid = state["frame_id"]
+            det = state["det"]
+            det_time = state["det_time"]
+            seq = state["det_seq"]
+            infer_ms = state["infer_ms"]
+
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        if fid == last_shown_id:
+            # no new camera frame yet: skip redrawing, keep the window responsive
+            if cv2.waitKey(5) & 0xFF == ord("q"):
+                break
+            continue
+        last_shown_id = fid
+
+        frame = frame.copy()
+
+        if ENABLE_ROI:
+            rx1, ry1, rx2, ry2 = get_roi_pixels(frame.shape, ROI_FRAC)
+            cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 255, 255), 2)
+        else:
+            rx1, ry1, rx2, ry2 = 0, 0, frame.shape[1], frame.shape[0]
+
+        in_roi = False
+        if det is not None:
+            x1, y1, x2, y2, conf = det
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+            in_roi = rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+
+        # Motion logic runs only when a NEW detection result arrives
+        if seq != last_seq:
+            last_seq = seq
+            if in_roi:
+                was_lost = False
+                if prev_center is not None:
+                    dx, dy = cx - prev_center[0], cy - prev_center[1]
+                    motion = classify_motion(dx, dy, MOVE_THRESHOLD)
+                    if motion == "STOP":
+                        stop_counter += 1
+                        if stop_counter >= STOP_FRAMES:
+                            print("Drone motion: STOP")
+                    else:
+                        stop_counter = 0
+                        print(f"Drone motion: {motion}")
+                prev_center = (cx, cy)
+            else:
+                if not was_lost:
+                    print("Drone motion: LOST")
+                    was_lost = True
+                prev_center = None
+                stop_counter = 0
+
+        if in_roi and (time.time() - det_time) < DET_TTL:
+            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            cv2.circle(frame, (int(cx), int(cy)), 4, (0, 0, 255), -1)
+            cv2.putText(frame, f"Drone {conf:.2f}", (int(x1), max(int(y1) - 10, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        cv2.putText(frame, f"infer: {infer_ms:.0f} ms", (10, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        cv2.imshow("Drone Detection & Tracking", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    state["running"] = False
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
